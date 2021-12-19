@@ -1,0 +1,3 @@
+#!/bin/bash
+/etc/mine/start.sh &
+exit 0
