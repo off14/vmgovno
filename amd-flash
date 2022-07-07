@@ -1,0 +1,244 @@
+#!/bin/bash
+
+source colors
+
+ERR_OTHER=10
+ERR_NO_GPU=11
+ERR_INVALID_ARG=12
+ERR_FILE_NOT_FOUND=13
+
+n=`gpu-detect AMD`
+
+if [[ $n == 0 ]]; then
+	echo "No AMD GPUs detected"
+	exit $ERR_OTHER
+fi
+
+
+declare -A IDX=()
+declare -a BUSID=()
+
+get_busid() {
+	#adapter seg  bn dn dID       asic           flash      romsize test    bios p/n
+	#======= ==== == == ==== =============== ============== ======= ==== ================
+	#   0    0000 02 00 67DF Polaris10       M25P20/c         40000 pass 113-2E366AU-X5T
+	readarray -t amddata < <( amdvbflash -i )
+	for line in "${amddata[@]}"; do
+		if [[ "$line" =~ ^[[:space:]]*([0-9]+)[[:space:]]+[0-9]+[[:space:]]+([0-9a-fA-F]+) ]]; then
+			local busid="${BASH_REMATCH[2],,}:00"
+			local index="${BASH_REMATCH[1]}"
+			IDX["$busid"]="$index"
+			BUSID[$index]="$busid"
+		fi
+	done
+}
+
+
+print_busid() {
+	local busid
+	for busid in "${BUSID[@]}"; do
+		echo "$busid"
+	done
+}
+
+
+gpu_index=
+get_index() {
+	gpu_index=
+	local gpu="$1"
+	if [[ "${gpu/.0}" =~ ^([0-9a-fA-F]{2}+:00)$ ]]; then
+		local busid="${BASH_REMATCH[1]}"
+		if [[ -z "${IDX["$busid"]}" ]]; then
+			echo "${RED}ERROR: GPU ${BRED}$gpu${RED} not found or not supported${NOCOLOR}"
+			return $ERR_NO_GPU
+		fi
+		gpu="${IDX["$busid"]}"
+	elif [[ ! "$gpu" =~ ^[0-9]+$ ]]; then
+		echo "${RED}ERROR: Incorrect GPU specified - ${BRED}$gpu${NOCOLOR}"
+		return $ERR_INVALID_ARG
+	elif [[ -z "${BUSID[gpu]}" ]]; then
+		echo "${RED}ERROR: GPU ${BRED}$gpu${RED} not found or not supported${NOCOLOR}"
+		return $ERR_NO_GPU
+	fi
+	gpu_index=$((gpu + 0))
+}
+
+
+save_rom() {
+	if [[ $# -lt 2 ]]; then
+		echo "${RED}ERROR: GPU or file not specified${NOCOLOR}"
+		return $ERR_INVALID_ARG
+	fi
+
+	local filename="${@:${#@}}" # last param
+
+	if [[ -z "$filename" ]]; then
+		echo "${RED}ERROR: File not specified${NOCOLOR}"
+		return $ERR_INVALID_ARG
+	fi
+
+	get_index "$1" || return
+
+	local extra_args=
+	for (( i=2; i<$#; i++ )); do
+		extra_args="$extra_args ${!i}"
+	done
+
+	echo
+	echo "${YELLOW}===${NOCOLOR} GPU ${CYAN}$gpu_index${NOCOLOR}, ${PURPLE}${BUSID[$gpu_index]} ${WHITE}DOWNLOADING VBIOS ${YELLOW}=== $(date +%T)${NOCOLOR}"
+	local exitcode
+	amdvbflash -s $gpu_index $extra_args "$filename" 2>&1
+	exitcode=$?
+	[[ $exitcode -eq 0 && ! -f "$filename" ]] && exitcode=$ERR_FILE_NOT_FOUND
+	return $exitcode
+}
+
+
+save_all() {
+	local ret=0
+	local index
+	local exitcode
+
+	local filename="${@:${#@}}" # last param
+
+	if [[ -z "$filename" ]]; then
+		echo "${RED}ERROR: File not specified${NOCOLOR}"
+		return $ERR_INVALID_ARG
+	fi
+
+	# split filename
+	full="${filename##*/}"
+	path="${filename:0:${#filename} - ${#full}}"
+	name="${full%%.*}"
+	ext="${full:${#name} + 1}"
+
+	for index in "${!BUSID[@]}"; do
+		# /path/name[GPU].ext
+		save_rom $index "${path}${name}${index}${ext:+.}${ext}"
+		exitcode=$?
+		[[ $exitcode -ne 0 ]] && ret=$exitcode
+	done
+	return $ret
+}
+
+
+flash_rom() {
+	if [[ $# -lt 2 ]]; then
+		echo "${RED}ERROR: No GPU or file specified${NOCOLOR}"
+		return $ERR_INVALID_ARG
+	fi
+
+	local filename="${@:${#@}}" # last param
+
+	if [[ -z "$filename" || ! -f "$filename" ]]; then
+		echo "${RED}ERROR: File not found - ${BRED}$filename${NOCOLOR}"
+		return $ERR_FILE_NOT_FOUND
+	fi
+
+	get_index "$1" || return
+
+	local extra_args=
+	for (( i=2; i<$#; i++ )); do
+		extra_args="$extra_args ${!i}"
+	done
+
+	echo
+	echo "${YELLOW}===${NOCOLOR} GPU ${CYAN}$gpu_index${NOCOLOR}, ${PURPLE}${BUSID[$gpu_index]} ${WHITE}FLASHING VBIOS ${YELLOW}=== $(date +%T)${NOCOLOR}"
+	#echo -e "${PURPLE}=== Flashing card $gpu_index ===${NOCOLOR}"
+	local exitcode
+	amdvbflash -p $gpu_index $extra_args "$filename" 2>&1
+	exitcode=$?
+	[[ $exitcode -eq 2 ]] && exitcode=0 # Flash already programmed
+	return $exitcode
+}
+
+
+flash_all() {
+	local ret=0
+	local index
+	local exitcode
+
+	local filename="${@:${#@}}" # last param
+
+	if [[ -z "$filename" || ! -f "$filename" ]]; then
+		echo "${RED}ERROR: File not found - ${BRED}$filename${NOCOLOR}"
+		return $ERR_FILE_NOT_FOUND
+	fi
+
+	for index in "${!BUSID[@]}"; do
+		flash_rom $index "$@"
+		exitcode=$?
+		[[ $exitcode -ne 0 ]] && ret=$exitcode
+	done
+	return $ret
+}
+
+
+print_usage() {
+	echo "${CYAN}Usage:  amd-flash [command] [flasher options] <vbios.rom>${NOCOLOR}
+
+Command:${GREEN}
+${GREEN}  -l | --list               ${NOCOLOR}List supported GPU
+${GREEN}  -w | --write ${BGREEN}INDEX/BUSID  ${NOCOLOR}Write vbios image to GPU
+${GREEN}  --all                     ${NOCOLOR}Write vbios image to ${WHITE}all${NOCOLOR} AMD GPU
+${GREEN}  -s | --save ${BGREEN}INDEX/BUSID   ${NOCOLOR}Save vbios from GPU to file
+${GREEN}  -b | --backup             ${NOCOLOR}Save vbioses from all GPU to files
+${GREEN}  -v | --version            ${NOCOLOR}Print flasher version
+
+Flasher options ${YELLOW}(use with caution)${NOCOLOR}:
+${GREEN}  -f   ${NOCOLOR}Force flashing regardless of security checkings (AsicID, SSID, P/N and etc)
+${GREEN}  -fm  ${NOCOLOR}Force flashing bypassing BIOS memory config check
+${GREEN}  -fs  ${NOCOLOR}Force flashing bypassing BIOS SSID check
+${GREEN}  -fp  ${NOCOLOR}Force flashing bypassing BIOS P/N check
+${GREEN}  -fa  ${NOCOLOR}Force flashing bypassing already-programmed check
+${GREEN}  -fv  ${NOCOLOR}Force flashing bypassing newer BIOS version check
+
+Examples:
+${GREEN}  amd-flash -w 00:01 vbios.rom  ${NOCOLOR}Write bios.rom to GPU 00:01
+${GREEN}  amd-flash --all -f vbios.rom  ${NOCOLOR}Force write bios.rom to all GPU
+${GREEN}  amd-flash -s 0 vbios.rom      ${NOCOLOR}Save bios from GPU 0 to vbios.rom
+${GREEN}  amd-flash --backup vbios.rom  ${NOCOLOR}Save bioses from all GPU to files vbios0.rom, vbios1.rom, ...
+"
+}
+
+
+case "$1" in
+	-v|--version)
+		amdvbflash -h | grep -m1 -oP "version \K[0-9\.]+"
+	;;
+
+	-l|--list)
+		amdvbflash -i | cat -s
+	;;
+
+	-w|--write|-p)
+		get_busid
+		flash_rom "${@:2}"
+	;;
+
+	-s|--save)
+		get_busid
+		save_rom "${@:2}"
+	;;
+
+	--all)
+		get_busid
+		flash_all "${@:2}"
+	;;
+
+	-b|--backup)
+		get_busid
+		save_all "${@:2}"
+	;;
+
+	--busid)
+		get_busid
+		print_busid
+	;;
+
+	-h|--help|"")
+		print_usage
+	;;
+esac
+
+exit
